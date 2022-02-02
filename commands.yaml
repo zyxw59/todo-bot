@@ -1,0 +1,21 @@
+- id: 937868121044320289
+  version: 2
+  name: "task"
+  description: "Add a task to the todo list"
+  type: 1 # chat input
+  options:
+    - name: "task"
+      description: "the task to create"
+      type: 3 # string
+      required: true
+- id: 937878246148689950
+  version: 1
+  name: "done"
+  description: "Mark a task as done"
+  type: 1 # chat input
+  options:
+    - name: "task"
+      description: "index of the completed task"
+      type: 4 # integer
+      min_value: 1
+      required: true
