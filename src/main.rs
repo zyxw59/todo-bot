@@ -1,66 +1,20 @@
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use futures_util::StreamExt;
-use tokio::sync::{Mutex, RwLock};
 use twilight_gateway::{EventTypeFlags, Intents, Shard};
-use twilight_http::{client::InteractionClient, Client};
 use twilight_model::{
-    application::{callback::InteractionResponse, command::Command, interaction::Interaction},
+    application::{callback::InteractionResponse, interaction::Interaction},
     gateway::event::Event,
-    id::{marker::UserMarker, Id},
-    oauth::current_application_info::CurrentApplicationInfo,
 };
 use twilight_util::builder::CallbackDataBuilder;
 
-use crate::parser::{DoneCommand, TaskCommand, TodoCommand};
+use crate::{
+    parser::{DoneCommand, TaskCommand, TodoCommand},
+    state::State,
+};
 
 mod parser;
-
-struct State {
-    client: Client,
-    application: CurrentApplicationInfo,
-    db: RwLock<BTreeMap<Id<UserMarker>, Mutex<Vec<String>>>>,
-    token: String,
-}
-
-impl State {
-    async fn new() -> anyhow::Result<Arc<Self>> {
-        let token = std::fs::read_to_string("token")?.trim().to_owned();
-        let client = Client::new(token.clone());
-        let application = init_application(&client).await?;
-
-        Ok(Arc::new(State {
-            client,
-            application,
-            token,
-            db: RwLock::new(BTreeMap::new()),
-        }))
-    }
-
-    fn interaction_client(&self) -> InteractionClient {
-        self.client.interaction(self.application.id)
-    }
-
-    async fn init_commands(&self) -> anyhow::Result<()> {
-        let commands: Vec<Command> =
-            serde_yaml::from_reader(std::fs::File::open("commands.yaml")?)?;
-        let get_commands = self
-            .interaction_client()
-            .set_global_commands(&commands)
-            .exec()
-            .await
-            .map_err(pretty_error)?
-            .models()
-            .await?;
-
-        log::info!(
-            "registered commands: {:#}",
-            serde_json::to_value(get_commands)?,
-        );
-        Ok(())
-    }
-}
+mod state;
 
 #[tokio::main]
 async fn main() {
@@ -89,17 +43,6 @@ async fn main_inner() -> anyhow::Result<()> {
     }
 
     Ok(())
-}
-async fn init_application(client: &Client) -> anyhow::Result<CurrentApplicationInfo> {
-    let application = client
-        .current_user_application()
-        .exec()
-        .await
-        .map_err(pretty_error)?
-        .model()
-        .await?;
-
-    Ok(application)
 }
 
 async fn interaction_responder(state: Arc<State>, interaction: Interaction) {
