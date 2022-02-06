@@ -1,12 +1,12 @@
 use convert_case::{Case, Casing};
-use darling::{ast, FromDeriveInput, FromField, FromMeta};
+use darling::{ast, Error, FromDeriveInput, FromField, FromMeta};
 use proc_macro2::TokenStream;
 use quote::quote;
 use syn::parse_macro_input;
 
 #[derive(FromDeriveInput)]
 #[darling(attributes(command), supports(struct_any))]
-struct StructAttrs {
+struct StructAttrsRaw {
     ident: syn::Ident,
     /// Name of the command. Default to the identifier, translated to snake case.
     #[darling(default)]
@@ -17,17 +17,255 @@ struct StructAttrs {
     /// Description of the command.
     #[darling(default)]
     description: String,
-    data: ast::Data<(), OptionAttrs>,
+    data: ast::Data<(), OptionAttrsRaw>,
+}
+
+struct StructAttrs {
+    ident: syn::Ident,
+    name: String,
+    version: u64,
+    description: String,
+    fields: StructFields,
+}
+
+impl FromDeriveInput for StructAttrs {
+    fn from_derive_input(input: &syn::DeriveInput) -> Result<Self, Error> {
+        let raw = StructAttrsRaw::from_derive_input(input)?;
+        let mut errors = Vec::new();
+        let ident = raw.ident;
+        let name = raw
+            .name
+            .unwrap_or_else(|| ident.to_string().to_case(Case::Snake));
+        let description = raw.description;
+        if let Err(e) = validate_non_empty(&name, "name") {
+            errors.push(e);
+        }
+        if let Err(e) = validate_non_empty(&description, "description") {
+            errors.push(e);
+        }
+        let version = raw.version.unwrap_or(1);
+        let fields: StructFields = raw
+            .data
+            .take_struct()
+            .ok_or(Error::unsupported_shape("enum"))?
+            .try_into()?;
+        Ok(StructAttrs {
+            ident,
+            name,
+            version,
+            description,
+            fields,
+        })
+    }
+}
+
+fn validate_non_empty(value: &str, name: &str) -> Result<(), Error> {
+    if value.is_empty() {
+        Err(Error::custom(format_args!(
+            "'{name}' attrbute cannot be empty"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+enum StructFields {
+    Unit,
+    Tuple(Vec<TupleField>),
+    Struct(Vec<StructField>),
+}
+
+impl TryFrom<darling::ast::Fields<OptionAttrsRaw>> for StructFields {
+    type Error = Error;
+
+    fn try_from(fields: darling::ast::Fields<OptionAttrsRaw>) -> Result<Self, Self::Error> {
+        match fields.style {
+            darling::ast::Style::Unit => {
+                if !fields.fields.is_empty() {
+                    Err(Error::custom("unexpected fields on unit struct"))
+                } else {
+                    Ok(StructFields::Unit)
+                }
+            }
+            darling::ast::Style::Tuple => {
+                let mut errors = Vec::new();
+                let mut parsed_fields = Vec::with_capacity(fields.fields.len());
+                for field in fields.fields {
+                    if field.ident.is_some() {
+                        errors.push(Error::custom("unexpected identifier on tuple struct field"));
+                    }
+                    match TupleField::try_from(field) {
+                        Ok(field) => parsed_fields.push(field),
+                        Err(error) => errors.push(error),
+                    }
+                }
+                if errors.is_empty() {
+                    Ok(StructFields::Tuple(parsed_fields))
+                } else {
+                    Err(Error::multiple(errors).flatten())
+                }
+            }
+            darling::ast::Style::Struct => {
+                let mut errors = Vec::new();
+                let mut parsed_fields = Vec::with_capacity(fields.fields.len());
+                for field in fields.fields {
+                    match StructField::try_from(field) {
+                        Ok(field) => parsed_fields.push(field),
+                        Err(error) => errors.push(error),
+                    }
+                }
+                if errors.is_empty() {
+                    Ok(StructFields::Struct(parsed_fields))
+                } else {
+                    Err(Error::multiple(errors).flatten())
+                }
+            }
+        }
+    }
+}
+
+struct TupleField {
+    name: String,
+    ty: syn::Type,
+    option: ParsedOption,
+}
+
+impl TupleField {
+    fn to_command_option(&self) -> Option<TokenStream> {
+        if let ParsedOption::Explicit(option) = &self.option {
+            let ty = &self.ty;
+            let name = &self.name;
+            let description = &option.description;
+            let autocomplete = option.autocomplete;
+            let min_value = number_to_command_option_value(option.min);
+            let max_value = number_to_command_option_value(option.max);
+            Some(quote! {
+                <#ty as ::command::ParseOption>::option(
+                    ::command::OptionMeta {
+                        name: #name.into(),
+                        description: #description.into(),
+                        autocomplete: #autocomplete,
+                        required: true,
+                        min_value: #min_value,
+                        max_value: #max_value,
+                    },
+                )
+            })
+        } else {
+            None
+        }
+    }
+
+    fn to_get(&self) -> TokenStream {
+        let name = &self.name;
+        match &self.option {
+            ParsedOption::Implicit(option) => {
+                let implicit = &option.implicit;
+                quote!(#implicit(&command).map_err(|error| {
+                    ::command::CommandError::ImplicitOption {
+                        option: #name,
+                        error,
+                    }
+                })?)
+            }
+            ParsedOption::Explicit(_) => {
+                let ty = &self.ty;
+                quote! {
+                    <#ty as ::command::ParseOption>::parse(
+                        options.get(#name).copied()
+                    )
+                        .map_err(|error| {
+                            ::command::CommandError::ExplicitOption {
+                                option: #name,
+                                error,
+                            }
+                        })?
+                }
+            }
+        }
+    }
+}
+
+impl TryFrom<OptionAttrsRaw> for TupleField {
+    type Error = Error;
+
+    fn try_from(field: OptionAttrsRaw) -> Result<Self, Self::Error> {
+        let mut errors = Vec::new();
+        let name = field.name.ok_or_else(|| Error::missing_field("name"))?;
+        if let Err(e) = validate_non_empty(&name, "name") {
+            errors.push(e);
+        }
+        let option = if let Some(implicit) = field.implicit {
+            ParsedOption::Implicit(ImplicitOption { implicit })
+        } else {
+            let description = field
+                .description
+                .ok_or_else(|| Error::missing_field("description"))?;
+            if let Err(e) = validate_non_empty(&description, "description") {
+                errors.push(e);
+            }
+            ParsedOption::Explicit(ExplicitOption {
+                description,
+                autocomplete: field.autocomplete,
+                min: field.min,
+                max: field.max,
+            })
+        };
+        if !errors.is_empty() {
+            Err(Error::multiple(errors).flatten())
+        } else {
+            Ok(TupleField {
+                name,
+                ty: field.ty,
+                option,
+            })
+        }
+    }
+}
+
+struct StructField {
+    ident: syn::Ident,
+    field: TupleField,
+}
+
+impl TryFrom<OptionAttrsRaw> for StructField {
+    type Error = Error;
+
+    fn try_from(mut field: OptionAttrsRaw) -> Result<Self, Self::Error> {
+        let ident = field
+            .ident
+            .clone()
+            .ok_or_else(|| Error::custom("missing identifier for struct field"))?;
+        if field.name.is_none() {
+            field.name = Some(ident.to_string().to_case(Case::Snake));
+        }
+        Ok(StructField {
+            ident,
+            field: field.try_into()?,
+        })
+    }
+}
+
+enum ParsedOption {
+    Implicit(ImplicitOption),
+    Explicit(ExplicitOption),
+}
+
+struct ImplicitOption {
+    implicit: syn::Path,
+}
+
+struct ExplicitOption {
+    description: String,
+    autocomplete: bool,
+    min: Option<Number>,
+    max: Option<Number>,
 }
 
 impl StructAttrs {
     fn consts(&self) -> TokenStream {
-        let ident = &self.ident;
-        let name = self
-            .name
-            .clone()
-            .unwrap_or_else(|| ident.to_string().to_case(Case::Snake));
-        let version = self.version.unwrap_or(1);
+        let name = &self.name;
+        let version = self.version;
         let description = &self.description;
 
         quote! {
@@ -57,47 +295,22 @@ impl StructAttrs {
     }
 
     fn command_options(&self) -> Vec<TokenStream> {
-        if let ast::Data::Struct(fields) = &self.data {
-            let mut options = Vec::with_capacity(fields.fields.len());
-            for option in &fields.fields {
-                if let OptionAttrs::Explicit(option) = option {
-                    let ty = &option.ty;
-                    let name = option.name();
-                    let description = &option.description;
-                    let autocomplete = option.autocomplete;
-                    let min_value = number_to_command_option_value(option.min);
-                    let max_value = number_to_command_option_value(option.max);
-                    options.push(quote! {
-                        <#ty as ::command::ParseOption>::option(
-                            ::command::OptionMeta {
-                                name: #name.into(),
-                                description: #description.into(),
-                                autocomplete: #autocomplete,
-                                required: true,
-                                min_value: #min_value,
-                                max_value: #max_value,
-                            },
-                        )
-                    });
-                }
-            }
-            options
-        } else {
-            panic!("Expected struct");
+        match &self.fields {
+            StructFields::Unit => Vec::new(),
+            StructFields::Tuple(fields) => fields
+                .iter()
+                .flat_map(TupleField::to_command_option)
+                .collect(),
+            StructFields::Struct(fields) => fields
+                .iter()
+                .map(|f| &f.field)
+                .flat_map(TupleField::to_command_option)
+                .collect(),
         }
     }
 
     fn parse(&self) -> TokenStream {
         let options = self.parse_options();
-        let init = if let ast::Data::Struct(fields) = &self.data {
-            match fields.style {
-                darling::ast::Style::Tuple => quote!((#(#options),*)),
-                darling::ast::Style::Struct => quote!({ #(#options),* }),
-                darling::ast::Style::Unit => quote!(),
-            }
-        } else {
-            panic!("Expected struct");
-        };
         quote! {
             fn parse(
                 command: ::command::ApplicationCommand,
@@ -108,136 +321,47 @@ impl StructAttrs {
                     .iter()
                     .map(|opt| (&*opt.name, &opt.value))
                     .collect::<::std::collections::BTreeMap<_, _>>();
-                Ok(Self #init)
+                Ok(#options)
             }
         }
     }
 
-    fn parse_options(&self) -> Vec<TokenStream> {
-        if let ast::Data::Struct(fields) = &self.data {
-            let mut options = Vec::with_capacity(fields.fields.len());
-            for option in &fields.fields {
-                let name = option.name();
-                let get = match option {
-                    OptionAttrs::Implicit(option) => {
-                        let implicit = &option.implicit;
-                        quote!(#implicit(&command).map_err(|error| {
-                            ::command::CommandError::ImplicitOption {
-                                option: #name,
-                                error,
-                            }
-                        })?)
-                    }
-                    OptionAttrs::Explicit(option) => {
-                        let ty = &option.ty;
-                        quote! {
-                            <#ty as ::command::ParseOption>::parse(options.get(#name).copied())
-                                .map_err(|error| {
-                                    ::command::CommandError::ExplicitOption {
-                                        option: #name,
-                                        error,
-                                    }
-                                })?
-                        }
-                    }
-                };
-                if let Some(ident) = option.ident() {
-                    options.push(quote!(#ident: #get));
-                } else {
-                    options.push(get);
-                }
+    fn parse_options(&self) -> TokenStream {
+        match &self.fields {
+            StructFields::Unit => quote!(Self),
+            StructFields::Tuple(fields) => {
+                let options = fields.iter().map(TupleField::to_get);
+                quote!(Self(#(#options),*))
             }
-            options
-        } else {
-            panic!("Expected struct");
-        }
-    }
-}
-
-enum OptionAttrs {
-    Implicit(ImplicitOptionAttrs),
-    Explicit(ExplicitOptionAttrs),
-}
-
-impl OptionAttrs {
-    fn ident(&self) -> Option<&syn::Ident> {
-        match self {
-            OptionAttrs::Implicit(option) => option.ident.as_ref(),
-            OptionAttrs::Explicit(option) => option.ident.as_ref(),
-        }
-    }
-
-    fn name(&self) -> String {
-        match self {
-            OptionAttrs::Implicit(option) => option.name(),
-            OptionAttrs::Explicit(option) => option.name(),
-        }
-    }
-}
-
-impl FromField for OptionAttrs {
-    fn from_field(field: &syn::Field) -> Result<Self, darling::Error> {
-        match ImplicitOptionAttrs::from_field(field) {
-            Ok(implicit) => Ok(OptionAttrs::Implicit(implicit)),
-            Err(implicit_err) => match ExplicitOptionAttrs::from_field(field) {
-                Ok(explicit) => Ok(OptionAttrs::Explicit(explicit)),
-                Err(explicit_err) => {
-                    Err(darling::Error::multiple(vec![implicit_err, explicit_err]))
-                }
-            },
+            StructFields::Struct(fields) => {
+                let options = fields.iter().map(|f| {
+                    let ident = &f.ident;
+                    let get = f.field.to_get();
+                    quote!(#ident: #get)
+                });
+                quote!(Self { #(#options),* })
+            }
         }
     }
 }
 
 #[derive(FromField)]
 #[darling(attributes(command))]
-struct ImplicitOptionAttrs {
-    ident: Option<syn::Ident>,
-    #[darling(default)]
-    name: Option<String>,
-    implicit: syn::Path,
-}
-
-impl ImplicitOptionAttrs {
-    fn name(&self) -> String {
-        self.name
-            .clone()
-            .or_else(|| {
-                self.ident
-                    .as_ref()
-                    .map(|id| id.to_string().to_case(Case::Snake))
-            })
-            .expect("Missing `name` for option")
-    }
-}
-
-#[derive(FromField)]
-#[darling(attributes(command))]
-struct ExplicitOptionAttrs {
+struct OptionAttrsRaw {
     ident: Option<syn::Ident>,
     ty: syn::Type,
     #[darling(default)]
     name: Option<String>,
-    description: String,
+    #[darling(default)]
+    description: Option<String>,
+    #[darling(default)]
+    implicit: Option<syn::Path>,
     #[darling(default)]
     autocomplete: bool,
     #[darling(default)]
     min: Option<Number>,
     #[darling(default)]
     max: Option<Number>,
-}
-
-impl ExplicitOptionAttrs {
-    fn name(&self) -> String {
-        self.name
-            .clone()
-            .or_else(|| {
-                self.ident
-                    .as_ref()
-                    .map(|id| id.to_string().to_case(Case::Snake))
-            })
-            .expect("Missing `name` for option")
-    }
 }
 
 #[derive(FromMeta, Clone, Copy)]
