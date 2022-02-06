@@ -15,7 +15,6 @@ struct StructAttrsRaw {
     #[darling(default)]
     version: Option<u64>,
     /// Description of the command.
-    #[darling(default)]
     description: String,
     data: ast::Data<(), OptionAttrsRaw>,
 }
@@ -44,18 +43,25 @@ impl FromDeriveInput for StructAttrs {
             errors.push(e);
         }
         let version = raw.version.unwrap_or(1);
-        let fields: StructFields = raw
+        match raw
             .data
             .take_struct()
-            .ok_or(Error::unsupported_shape("enum"))?
-            .try_into()?;
-        Ok(StructAttrs {
-            ident,
-            name,
-            version,
-            description,
-            fields,
-        })
+            .ok_or(Error::unsupported_shape("enum"))
+            .and_then(StructFields::try_from)
+        {
+            Ok(fields) if errors.is_empty() => Ok(StructAttrs {
+                ident,
+                name,
+                version,
+                description,
+                fields,
+            }),
+            Ok(_) => Err(Error::multiple(errors).flatten()),
+            Err(e) => {
+                errors.push(e);
+                Err(Error::multiple(errors).flatten())
+            }
+        }
     }
 }
 
@@ -382,23 +388,23 @@ fn number_to_command_option_value(number: Option<Number>) -> TokenStream {
 #[proc_macro_derive(ParseCommand, attributes(command))]
 pub fn derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input = parse_macro_input!(input);
-    let this = StructAttrs::from_derive_input(&input)
-        .map_err(|e| eprintln!("{e}"))
-        .unwrap();
+    match StructAttrs::from_derive_input(&input) {
+        Ok(this) => {
+            let ident = &this.ident;
+            let consts = this.consts();
+            let command = this.command();
+            let parse = this.parse();
 
-    let ident = &this.ident;
-    let consts = this.consts();
-    let command = this.command();
-    let parse = this.parse();
-
-    let output = quote! {
-        #[automatically_derived]
-        impl ParseCommand for #ident {
-            #consts
-            #command
-            #parse
+            quote! {
+                #[automatically_derived]
+                impl ParseCommand for #ident {
+                    #consts
+                    #command
+                    #parse
+                }
+            }
         }
-    };
-
-    output.into()
+        Err(e) => e.write_errors(),
+    }
+    .into()
 }
