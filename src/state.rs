@@ -4,7 +4,6 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use twilight_http::{client::InteractionClient, Client};
 use twilight_model::{
-    application::command::Command,
     id::{marker::UserMarker, Id},
     oauth::current_application_info::CurrentApplicationInfo,
 };
@@ -35,11 +34,9 @@ impl State {
     }
 
     pub async fn init_commands(&self) -> anyhow::Result<()> {
-        let commands: Vec<Command> =
-            serde_yaml::from_reader(std::fs::File::open("commands.yaml")?)?;
         let get_commands = self
             .interaction_client()
-            .set_global_commands(&commands)
+            .set_global_commands(&crate::commands::COMMANDS)
             .exec()
             .await
             .map_err(crate::pretty_error)?

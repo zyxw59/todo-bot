@@ -9,11 +9,11 @@ use twilight_model::{
 use twilight_util::builder::CallbackDataBuilder;
 
 use crate::{
-    parser::{DoneCommand, TaskCommand, TodoCommand},
+    commands::{DoneCommand, TaskCommand, TodoCommand},
     state::State,
 };
 
-mod parser;
+mod commands;
 mod state;
 
 #[tokio::main]

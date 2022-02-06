@@ -1,2 +1,4 @@
 token
-/target
+**/target
+command/Cargo.lock
+command-derive/Cargo.lock
