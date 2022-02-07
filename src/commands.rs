@@ -38,24 +38,22 @@ impl TodoCommand {
     }
 }
 
+/// Add a task to the todo list
 #[derive(ParseCommand, Debug)]
-#[command(
-    name = "task",
-    version = 2,
-    description = "Add a task to the todo list"
-)]
+#[command(name = "task", version = 2)]
 pub struct TaskCommand {
     #[command(implicit = "command::parse_user")]
     pub user: Id<UserMarker>,
-    #[command(description = "the task to create")]
+    /// The task to create
     pub task: String,
 }
 
+/// Mark a task as done
 #[derive(ParseCommand, Debug)]
-#[command(name = "done", version = 1, description = "Mark a task as done")]
+#[command(name = "done", version = 1)]
 pub struct DoneCommand {
     #[command(implicit = "command::parse_user")]
     pub user: Id<UserMarker>,
-    #[command(description = "the index of the command to mark completed")]
+    /// The index of the command to mark completed
     pub task: usize,
 }

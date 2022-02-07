@@ -5,7 +5,7 @@ use quote::quote;
 use syn::parse_macro_input;
 
 #[derive(FromDeriveInput)]
-#[darling(attributes(command), supports(struct_any))]
+#[darling(attributes(command), supports(struct_any), forward_attrs(doc))]
 struct StructAttrsRaw {
     ident: syn::Ident,
     /// Name of the command. Default to the identifier, translated to snake case.
@@ -15,7 +15,9 @@ struct StructAttrsRaw {
     #[darling(default)]
     version: Option<u64>,
     /// Description of the command.
-    description: String,
+    #[darling(default)]
+    description: Option<String>,
+    attrs: Vec<syn::Attribute>,
     data: ast::Data<(), OptionAttrsRaw>,
 }
 
@@ -35,11 +37,14 @@ impl FromDeriveInput for StructAttrs {
         let name = raw
             .name
             .unwrap_or_else(|| ident.to_string().to_case(Case::Snake));
-        let description = raw.description;
-        if let Err(e) = validate_non_empty(&name, "name") {
+        let description = raw
+            .description
+            .or_else(|| parse_doc_comments(&raw.attrs))
+            .ok_or_else(|| Error::missing_field("description"))?;
+        if let Err(e) = validate_length(&name, "name", 1, 32) {
             errors.push(e);
         }
-        if let Err(e) = validate_non_empty(&description, "description") {
+        if let Err(e) = validate_length(&description, "description", 1, 100) {
             errors.push(e);
         }
         let version = raw.version.unwrap_or(1);
@@ -65,10 +70,28 @@ impl FromDeriveInput for StructAttrs {
     }
 }
 
-fn validate_non_empty(value: &str, name: &str) -> Result<(), Error> {
-    if value.is_empty() {
+fn parse_doc_comments<'a>(attrs: impl IntoIterator<Item = &'a syn::Attribute>) -> Option<String> {
+    for attr in attrs {
+        if let Ok(syn::Meta::NameValue(meta)) = attr.parse_meta() {
+            if let (Some("doc"), syn::Lit::Str(lit)) = (
+                meta.path.get_ident().map(ToString::to_string).as_deref(),
+                meta.lit,
+            ) {
+                let val = lit.value();
+                let s = val.trim();
+                if !s.is_empty() {
+                    return Some(s.to_owned());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn validate_length(value: &str, name: &str, min: usize, max: usize) -> Result<(), Error> {
+    if value.len() < min || value.len() > max {
         Err(Error::custom(format_args!(
-            "'{name}' attrbute cannot be empty"
+            "{name} attribute must be between {min} and {max} chars long"
         )))
     } else {
         Ok(())
@@ -198,7 +221,7 @@ impl TryFrom<OptionAttrsRaw> for TupleField {
     fn try_from(field: OptionAttrsRaw) -> Result<Self, Self::Error> {
         let mut errors = Vec::new();
         let name = field.name.ok_or_else(|| Error::missing_field("name"))?;
-        if let Err(e) = validate_non_empty(&name, "name") {
+        if let Err(e) = validate_length(&name, "name", 1, 32) {
             errors.push(e);
         }
         let option = if let Some(implicit) = field.implicit {
@@ -206,8 +229,9 @@ impl TryFrom<OptionAttrsRaw> for TupleField {
         } else {
             let description = field
                 .description
+                .or_else(|| parse_doc_comments(&field.attrs))
                 .ok_or_else(|| Error::missing_field("description"))?;
-            if let Err(e) = validate_non_empty(&description, "description") {
+            if let Err(e) = validate_length(&description, "description", 1, 100) {
                 errors.push(e);
             }
             ParsedOption::Explicit(ExplicitOption {
@@ -352,7 +376,7 @@ impl StructAttrs {
 }
 
 #[derive(FromField)]
-#[darling(attributes(command))]
+#[darling(attributes(command), forward_attrs(doc))]
 struct OptionAttrsRaw {
     ident: Option<syn::Ident>,
     ty: syn::Type,
@@ -368,6 +392,7 @@ struct OptionAttrsRaw {
     min: Option<Number>,
     #[darling(default)]
     max: Option<Number>,
+    attrs: Vec<syn::Attribute>,
 }
 
 #[derive(FromMeta, Clone, Copy)]
