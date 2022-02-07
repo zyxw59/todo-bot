@@ -56,4 +56,6 @@ pub struct TaskCommand {
 pub struct DoneCommand {
     #[command(implicit = "command::parse_user")]
     pub user: Id<UserMarker>,
+    #[command(description = "the index of the command to mark completed")]
+    pub task: usize,
 }
